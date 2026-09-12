@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "jocahdj.omaspace",
+  "name": "OmaSpace",
+  "version": "1.1.0",
+  "author": "jocahdj",
+  "license": "MIT",
+  "description": "Save the apps on each workspace and restore them with a click or on boot",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "OmaSpace",
+    "description": "Save/restore which apps live on which workspace",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
