@@ -250,9 +250,28 @@ cmd_restore() {
   local launcher_dir
   launcher_dir="$(mktemp -d "$STATE_DIR/.window-layouts-launch.XXXXXX")"
 
-  local launched=0
+  # Snapshot how many windows of each class already exist *before* touching
+  # anything, so an app that's already open isn't relaunched as a duplicate.
+  # This is consumed as a budget below: the Nth already-open window of a
+  # class satisfies the Nth entry asking for that class, so a layout with
+  # two "foot" entries on different workspaces still opens a second one once
+  # the one already-open foot has been credited to the first.
+  local -A already_open
+  while IFS=$'\t' read -r cls cnt; do
+    [[ -n "$cls" ]] || continue
+    already_open["$cls"]=$cnt
+  done < <(hyprctl clients -j 2>/dev/null | jq -r '.[] | select(.mapped == true) | .class' | sort | uniq -c | awk '{$1=$1; print $2"\t"$1}')
+
+  local launched=0 skipped=0
   while IFS=$'\t' read -r ws class cmd_json; do
     [[ -n "$cmd_json" ]] || continue
+
+    if [[ "${already_open[$class]:-0}" -gt 0 ]]; then
+      already_open["$class"]=$(( already_open[$class] - 1 ))
+      skipped=$((skipped + 1))
+      continue
+    fi
+
     launched=$((launched + 1))
 
     local launcher="$launcher_dir/$launched.sh"
@@ -271,7 +290,11 @@ cmd_restore() {
   (sleep 10 && rm -rf "$launcher_dir") >/dev/null 2>&1 &
   disown
 
-  notify "Restored '$name' ($launched windows)"
+  if [[ "$skipped" -gt 0 ]]; then
+    notify "Restored '$name' ($launched opened, $skipped already open)"
+  else
+    notify "Restored '$name' ($launched windows)"
+  fi
 }
 
 cmd_delete() {
