@@ -19,14 +19,42 @@
 
 set -uo pipefail
 
+# Every helper this script shells out to (hyprctl, jq, omarchy, sed, mktemp,
+# ...) is a standard part of the base OS install and lives under /usr/bin on
+# Omarchy. Pinning PATH here means all of them resolve to that known,
+# root-owned location regardless of what PATH looked like in the calling
+# environment (e.g. the Quickshell process, a hook runner, or a user shell),
+# rather than trusting whatever earlier-in-PATH entry happens to exist.
+export PATH=/usr/bin
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 STATE_FILE="$STATE_DIR/window-layouts.json"
 
+# A hard ceiling on the state file's size, checked before it's ever parsed.
+# This is a sanity/DoS bound, not a realistic layout size -- a legitimate
+# file with dozens of layouts and windows is a few KB.
+readonly MAX_STATE_FILE_BYTES=$((2 * 1024 * 1024))
+readonly MAX_CMD_ARGS=64
+readonly MAX_ARG_LEN=4096
+
 mkdir -p "$STATE_DIR"
 
 ensure_state_file() {
-  [[ -s "$STATE_FILE" ]] || printf '{"layouts":{},"bootLayout":""}' >"$STATE_FILE"
+  if [[ ! -s "$STATE_FILE" ]]; then
+    printf '{"layouts":{},"bootLayout":""}' >"$STATE_FILE"
+    return
+  fi
+
+  # A state file this large is not a realistic layout collection -- treat it
+  # as corrupted/tampered rather than ever parsing it, and start fresh.
+  local size
+  size="$(stat -c%s "$STATE_FILE" 2>/dev/null || echo 0)"
+  if (( size > MAX_STATE_FILE_BYTES )); then
+    mv "$STATE_FILE" "$STATE_FILE.rejected-$(date +%s)" 2>/dev/null || true
+    printf '{"layouts":{},"bootLayout":""}' >"$STATE_FILE"
+    notify "State file was abnormally large and has been reset"
+  fi
 }
 
 notify() {
@@ -95,6 +123,63 @@ wait_for_new_window_of_class() {
   return 1
 }
 
+# Splits $1 into words on plain whitespace, honoring "double quoted"
+# segments and backslash-escapes of `" \ $ ` ` (mirroring the Desktop Entry
+# spec's Exec= quoting) — printed as a JSON string array. This is pure
+# character-by-character scanning: the input is only ever treated as data,
+# never handed to a shell/`eval` to interpret, so nothing in it (`;`, `$(...)`,
+# backticks, redirects, etc.) can execute anything, no matter how it got here
+# (a .desktop file's Exec= line, or a flattened /proc/<pid>/cmdline value
+# recovered from persisted state).
+tokenize_words() {
+  local line="$1"
+  local -a tokens=()
+  local token="" in_quotes=0 have_token=0
+  local i=0 len=${#line} char next
+  while (( i < len )); do
+    char="${line:i:1}"
+    if (( in_quotes )); then
+      if [[ "$char" == '"' ]]; then
+        in_quotes=0
+      elif [[ "$char" == '\' ]] && (( i + 1 < len )); then
+        next="${line:i+1:1}"
+        if [[ "$next" == '"' || "$next" == '\' || "$next" == '$' || "$next" == '`' ]]; then
+          token+="$next"
+          i=$((i + 1))
+        else
+          token+="$char"
+        fi
+      else
+        token+="$char"
+      fi
+      have_token=1
+    else
+      if [[ "$char" == ' ' || "$char" == $'\t' ]]; then
+        if (( have_token )); then
+          tokens+=("$token")
+          token=""
+          have_token=0
+        fi
+      elif [[ "$char" == '"' ]]; then
+        in_quotes=1
+        have_token=1
+      else
+        token+="$char"
+        have_token=1
+      fi
+    fi
+    i=$((i + 1))
+  done
+  (( have_token )) && tokens+=("$token")
+
+  (( ${#tokens[@]} <= MAX_CMD_ARGS )) || return 1
+  for token in "${tokens[@]:-}"; do
+    (( ${#token} <= MAX_ARG_LEN )) || return 1
+  done
+
+  printf '%s\0' "${tokens[@]}" | jq -R -s -c 'split("\u0000")[:-1]'
+}
+
 # Writes a one-shot launcher script with $cmd_json's argv baked in via normal
 # bash quoting (see cmd_restore's header comment for why this crosses the
 # Lua/shell boundary instead of the raw command).
@@ -103,22 +188,27 @@ build_launcher() {
   local count first
   count="$(jq 'length' <<<"$cmd_json")"
   first="$(jq -r '.[0]' <<<"$cmd_json")"
+
+  if [[ "$count" -eq 1 && "$first" == *' '* ]]; then
+    # A single argv element containing spaces is a strong signal the real
+    # command line got flattened into one string somewhere upstream (seen
+    # with some Electron apps' /proc/<pid>/cmdline) rather than kept as real
+    # argv — exec'ing it literally would try to run a file whose name is
+    # that whole string. Recovering the intended words with a plain,
+    # non-executing tokenizer (rather than `sh -c`) means nothing in a
+    # stored value — however it got there — is ever interpreted as shell
+    # syntax.
+    local recovered
+    recovered="$(tokenize_words "$first")" || return 1
+    cmd_json="$recovered"
+  fi
+
   {
     printf '#!/bin/bash\n'
-    if [[ "$count" -eq 1 && "$first" == *' '* ]]; then
-      # A single argv element containing spaces is a strong signal the real
-      # command line got flattened into one string somewhere upstream (seen
-      # with some Electron apps' /proc/<pid>/cmdline) rather than kept as
-      # real argv — exec'ing it literally would try to run a file whose name
-      # is that whole string. Handing it to a shell instead recovers the
-      # intended words generically, with no per-app special-casing.
-      printf 'exec sh -c %s\n' "$(jq -r '.[0] | @sh' <<<"$cmd_json")"
-    else
-      printf 'exec'
-      while IFS= read -r quoted_arg; do printf ' %s' "$quoted_arg"; done \
-        < <(jq -r '.[] | @sh' <<<"$cmd_json")
-      printf '\n'
-    fi
+    printf 'exec'
+    while IFS= read -r quoted_arg; do printf ' %s' "$quoted_arg"; done \
+      < <(jq -r '.[] | @sh' <<<"$cmd_json")
+    printf '\n'
   } >"$launcher"
   chmod +x "$launcher"
 }
@@ -176,12 +266,10 @@ desktop_launch_cmd() {
   # per the Desktop Entry spec.
   exec_line="$(sed -E 's/%[fFuUick]//g; s/%%/%/g' <<<"$exec_line")"
 
-  # Tokenize the same way a shell would, since Exec= may quote arguments.
-  local argv=()
-  eval "argv=($exec_line)" 2>/dev/null || return 1
-  [[ ${#argv[@]} -gt 0 ]] || return 1
-
-  printf '%s\0' "${argv[@]}" | jq -R -s -c 'split("\u0000")[:-1]'
+  # Tokenize per the Desktop Entry spec's quoting rules, without ever
+  # handing this file's contents to `eval`/a shell to interpret -- see
+  # tokenize_words.
+  tokenize_words "$exec_line"
 }
 
 cmd_save() {
@@ -231,8 +319,43 @@ cmd_restore() {
   local name="${1:?Usage: window-layouts.sh restore <name>}"
   ensure_state_file
 
+  # Persisted state is treated as untrusted input, not as pre-validated
+  # command data, before any of it is allowed to influence what gets
+  # executed: the workspace key must look like a plain small integer (it's
+  # interpolated into a Lua string for the window rule/exec call below), and
+  # each entry must be a well-shaped {class: string, title: string, cmd:
+  # [string, ...]} within the same size bounds tokenize_words enforces.
+  # Anything that doesn't match this shape is dropped rather than used.
   local ws_map
-  ws_map="$(jq -c --arg name "$name" '.layouts[$name] // empty' "$STATE_FILE")"
+  ws_map="$(jq -c \
+    --arg name "$name" \
+    --argjson maxArgs "$MAX_CMD_ARGS" \
+    --argjson maxLen "$MAX_ARG_LEN" \
+    '
+      (.layouts[$name] // empty) as $raw
+      | if ($raw | type) != "object" then empty else
+          $raw
+          | with_entries(
+              select(.key | test("^[0-9]{1,4}$"))
+              | .value |= (
+                  if type != "array" then [] else
+                    map(
+                      select(
+                        (type == "object")
+                        and ((.class // "") | type == "string")
+                        and ((.title // "") | type == "string")
+                        and (.cmd | type == "array")
+                        and ((.cmd | length) > 0)
+                        and ((.cmd | length) <= $maxArgs)
+                        and (.cmd | all(type == "string" and (length <= $maxLen)))
+                      )
+                    )
+                  end
+                )
+              | select(.value | length > 0)
+            )
+        end
+    ' "$STATE_FILE")"
   if [[ -z "$ws_map" ]]; then
     notify "Layout '$name' not found"
     exit 1
