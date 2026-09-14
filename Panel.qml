@@ -7,9 +7,18 @@ import qs.Commons
 
 // Bar widget + popup panel for saving/restoring which apps live on which
 // Hyprland workspace. All the actual hyprctl/JSON work happens in the
-// bundled window-layouts.sh; this file is just the UI and fires it off with
-// Quickshell.execDetached, then re-reads its JSON state file (which the
-// script writes atomically) to refresh the list.
+// bundled window-layouts.sh; this file is just the UI.
+//
+// The helper is always started the same way (helperCommand /
+// helperEnvironment): a fixed interpreter, /bin/bash --noprofile --norc -p,
+// with the process environment cleared and only an explicit allowlist passed
+// through, so nothing inherited from the shell process (BASH_ENV, PATH,
+// exported functions, ...) can influence it.
+//
+// The panel never opens, watches or parses the state file itself. It asks
+// the helper for `list`, which does the ownership/mode-checked, size-bounded,
+// schema-validated read, and parses only that (additionally size-capped)
+// output.
 Panel {
   id: root
   moduleName: "jocahdj.omaspace"
@@ -20,8 +29,37 @@ Panel {
   }
 
   readonly property string scriptPath: localPath("window-layouts.sh")
-  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")
-  readonly property string statePath: root.stateHome + "/omarchy/window-layouts.json"
+
+  // Fixed shell for the helper. `-p` makes Bash ignore BASH_ENV/ENV,
+  // SHELLOPTS, BASHOPTS, CDPATH, GLOBIGNORE and inherited functions;
+  // --noprofile/--norc skip startup files.
+  readonly property var helperCommand: ["/bin/bash", "--noprofile", "--norc", "-p", "--", root.scriptPath]
+
+  // Environment allowlist, applied with clearEnvironment: true. A string
+  // value is set verbatim. With clearEnvironment, null passes that single
+  // variable through from the system environment if present, and nothing
+  // else is passed (Quickshell semantics).
+  //   PATH, LC_ALL                   fixed values
+  //   HOME, XDG_STATE_HOME           locate the protected state directory
+  //   XDG_RUNTIME_DIR,               let hyprctl reach the compositor socket
+  //   HYPRLAND_INSTANCE_SIGNATURE
+  //   DBUS_SESSION_BUS_ADDRESS,      let notifications reach the session
+  //   WAYLAND_DISPLAY
+  readonly property var helperEnvironment: ({
+    PATH: "/usr/bin",
+    LC_ALL: "C.UTF-8",
+    HOME: null,
+    XDG_STATE_HOME: null,
+    XDG_RUNTIME_DIR: null,
+    HYPRLAND_INSTANCE_SIGNATURE: null,
+    DBUS_SESSION_BUS_ADDRESS: null,
+    WAYLAND_DISPLAY: null
+  })
+
+  // Upper bound on `list` output the panel will parse. The helper reads at
+  // most 1 MiB of state and `list` strips command lines, so valid output is
+  // always smaller; anything larger is treated as invalid.
+  readonly property int maxListBytes: 2 * 1024 * 1024
 
   property var stateData: ({ layouts: {}, bootLayout: "" })
   property var layoutNames: []
@@ -30,7 +68,9 @@ Panel {
 
   function loadState(raw) {
     var parsed = null
-    try { parsed = JSON.parse(raw) } catch (e) { parsed = null }
+    if (typeof raw === "string" && raw.length <= root.maxListBytes) {
+      try { parsed = JSON.parse(raw) } catch (e) { parsed = null }
+    }
     if (!parsed || typeof parsed !== "object") parsed = {}
     if (!parsed.layouts || typeof parsed.layouts !== "object") parsed.layouts = {}
     if (typeof parsed.bootLayout !== "string") parsed.bootLayout = ""
@@ -38,6 +78,32 @@ Panel {
     var names = Object.keys(parsed.layouts)
     names.sort()
     root.layoutNames = names
+  }
+
+  // Re-reads state through the helper. If a read is already running, one
+  // more is queued so a change that lands mid-read is not missed.
+  property bool refreshPending: false
+  function refresh() {
+    if (stateReader.running) {
+      root.refreshPending = true
+      return
+    }
+    stateReader.running = true
+  }
+
+  // save / delete / set-boot run one at a time, in order, and the list is
+  // refreshed when each one exits.
+  property var pendingMutations: []
+  function runMutation(args) {
+    root.pendingMutations = root.pendingMutations.concat([args])
+    root.startNextMutation()
+  }
+  function startNextMutation() {
+    if (stateMutator.running || root.pendingMutations.length === 0) return
+    var next = root.pendingMutations[0]
+    root.pendingMutations = root.pendingMutations.slice(1)
+    stateMutator.command = root.helperCommand.concat(next)
+    stateMutator.running = true
   }
 
   function workspaceSummary(name) {
@@ -55,20 +121,24 @@ Panel {
     return parts.join("   ·   ")
   }
 
-  function runScript(args) {
-    Quickshell.execDetached([root.scriptPath].concat(args))
-  }
-
   function saveCurrentLayout() {
     var name = (root.newLayoutName || "").trim()
     if (!name) return
-    runScript(["save", name])
+    runMutation(["save", name])
   }
 
-  function restoreLayout(name) { runScript(["restore", name]) }
-  function deleteLayout(name) { runScript(["delete", name]) }
-  function setBootLayout(name) { runScript(["set-boot", name]) }
-  function clearBootLayout() { runScript(["set-boot", "none"]) }
+  // Restore can take several seconds (it waits for each window) and does not
+  // change state, so it runs detached with the same fixed shell/environment.
+  function restoreLayout(name) {
+    Quickshell.execDetached({
+      command: root.helperCommand.concat(["restore", name]),
+      clearEnvironment: true,
+      environment: root.helperEnvironment
+    })
+  }
+  function deleteLayout(name) { runMutation(["delete", name]) }
+  function setBootLayout(name) { runMutation(["set-boot", name]) }
+  function clearBootLayout() { runMutation(["set-boot", "none"]) }
 
   function requestDelete(name) { root.confirmDeleteName = name }
   function confirmDelete() {
@@ -80,15 +150,34 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  FileView {
-    id: stateFile
-    path: root.statePath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadState(text())
-    onLoadFailed: root.loadState("{}")
-    onFileChanged: reload()
+  Process {
+    id: stateReader
+    command: root.helperCommand.concat(["list"])
+    clearEnvironment: true
+    environment: root.helperEnvironment
+    stdout: StdioCollector {
+      onStreamFinished: root.loadState(this.text)
+    }
+    onExited: {
+      if (root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refresh)
+      }
+    }
   }
+
+  Process {
+    id: stateMutator
+    clearEnvironment: true
+    environment: root.helperEnvironment
+    onExited: {
+      Qt.callLater(root.refresh)
+      Qt.callLater(root.startNextMutation)
+    }
+  }
+
+  onOpenedChanged: if (root.opened) root.refresh()
+  Component.onCompleted: root.refresh()
 
   // A small fan of three slanted, solid rounded rectangles — like pages of
   // an open book — standing in for the app's "OmaSpace" bar icon instead of
