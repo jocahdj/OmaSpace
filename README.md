@@ -4,24 +4,40 @@
 Omarchy shell plugin: save which apps live on which Hyprland workspace, and
 restore them with a click — or automatically on login.
 
+## Installation and removal
+
+Requires Omarchy with Quattro/Quickshell, Hyprland’s Lua API, Bash 4.4+,
+GNU coreutils, jq and Python 3 at `/usr/bin/python3`. The helper also uses
+`omarchy hook install` and `omarchy-notification-send`.
+
+Install OmaSpace through the Omarchy plugin marketplace and add the OmaSpace
+widget to your bar. Keep `Panel.qml`, `window-layouts.sh`, `state-store.py`
+and `manifest.json` together in the installed plugin directory.
+
+Before removing the plugin through the plugin manager, disable **Run on boot**
+so its post-boot hook is removed. Saved layouts remain in
+`~/.local/state/omarchy/omaspace/`; you may delete that directory if you no
+longer need them. The plugin is licensed under the [MIT license](LICENSE).
+
 ## Use
 
-Click the ▦ icon in the bar (top-right by default).
+Click the layered pages icon in the bar (top-right by default).
 
 - **Save current layout** — snapshots every window on every workspace right
   now under the name typed into the field.
 - Each saved layout shows **Restore** (relaunches every app straight onto its
   saved workspace) and **✕** (delete, with confirmation).
-- Click the **☆** star on a layout to make it restore automatically after
-  login; click the filled **★** to turn that off again. Turning it on
+- Turn on a layout’s **Run on boot** switch to restore it automatically after
+  login; turn the switch off to disable that. Turning it on
   installs a small `post-boot` hook (via `omarchy hook install post-boot ...`,
   landing in `~/.config/omarchy/hooks/post-boot.d/window-layouts-boot-hook.sh`);
   turning it off again removes that hook.
 
 ## How it works
 
-All of the logic lives in `window-layouts.sh`, invoked by the QML UI via
-`Quickshell.execDetached`. Both problems below turned out to be widespread
+The QML UI invokes `window-layouts.sh` using Quickshell processes.
+`state-store.py` supplies the no-follow filesystem operations.
+Both problems below turned out to be widespread
 enough (affecting whole classes of apps, not one-off quirks) that the fix for
 each is generic — neither is a per-app special case.
 
@@ -54,8 +70,9 @@ each is generic — neither is a per-app special case.
 
 ## Security model
 
-The helper only ever runs commands it can reconstruct as an argv array. There
-is no `eval`, no `sh -c`, and nothing read from disk is re-parsed as shell.
+The helper only runs saved commands as argv arrays; it never splits a
+flattened persisted command string. There is no shell `eval`, no `sh -c`,
+and nothing read from disk is re-parsed as shell.
 Beyond that:
 
 - **Fixed shell, cleared environment.** The panel starts the helper as
@@ -66,20 +83,24 @@ Beyond that:
   `WAYLAND_DISPLAY`. The generated boot hook re-execs the helper the same way
   through `/usr/bin/env -i`. The script's `#!/bin/bash -p` shebang makes Bash
   ignore `BASH_ENV`, `SHELLOPTS` and inherited functions if it is ever run
-  directly.
+  directly. Generated launchers also use `/usr/bin/env -i` with this allowlist.
 - **Descriptor-relative state hierarchy.** State lives in
   `~/.local/state/omarchy/omaspace/`. The helper walks that path from `/` one
   component at a time through open directory descriptors
-  (`/proc/self/fd/N/<name>`, i.e. `openat`-style). Every component is
-  `lstat`ed first, so symlinks are refused rather than followed, then opened
-  and `fstat`ed to confirm it is the same inode. Ancestors must be owned by
+  using Python’s `dir_fd` operations and `O_DIRECTORY | O_NOFOLLOW`,
+  then checks ownership and mode with `fstat`. Python runs in isolated mode
+  (`/usr/bin/python3 -I -S`), and passes retained descriptors to the helper.
+  Ancestors must be owned by
   root or by you and not be group/other-writable. The `omaspace` directory
   must be owned by you with mode `0700`. Every later read, write, temp file,
   rename and delete goes through the open descriptor.
 - **Checked, bounded reads.** The state file is `lstat`ed before it is
-  opened, so a symlink, FIFO or device is never opened. The open descriptor
+  opened. `O_NOFOLLOW | O_NONBLOCK` also prevents a replacement symlink
+  from being followed or a replacement FIFO from blocking the helper.
+  The open descriptor
   must then be the same inode, a regular file owned by you, with one link, no
-  group/other write bit and at most 1 MiB. At most 1 MiB is read. A file that
+  group/other write bit and at most 1 MiB. A bounded read rejects growth
+  beyond 1 MiB and embedded NUL bytes. A file that
   fails any check is renamed to `layouts.json.rejected-<timestamp>` and never
   parsed.
 - **Strict schema.** Whatever is parsed is normalised by a fixed jq schema with
@@ -88,7 +109,8 @@ Beyond that:
   fit is dropped. Only this validated document is used by the panel, by
   `restore`, and by the boot hook's `restore-boot`.
 - **Atomic writes.** Changes go to a fresh `0600` temp file in the same
-  directory, which is verified and then renamed over the state file. The state
+  directory, opened with `O_EXCL | O_NOFOLLOW`, flushed and then renamed
+  over the state file. Writes exceeding 1 MiB are refused. The state
   file is never opened for writing.
 - **No direct state access from QML.** The panel never opens or watches the
   state file. It runs `window-layouts.sh list` under the same fixed shell and
@@ -115,3 +137,8 @@ Beyond that:
 - None of the directories on the path to `~/.local/state/omarchy/omaspace/`
   may be symlinks. If yours are, the helper refuses to run and says which
   component it rejected.
+
+State protections prevent other users and unsafe filesystem entries from
+supplying executable state. Your own account remains trusted: editing an
+accepted layout’s command array changes what Restore and Run on boot execute.
+Schema validation does not certify that a command is safe.

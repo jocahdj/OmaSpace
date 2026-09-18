@@ -34,15 +34,15 @@
 #   mode makes Bash ignore BASH_ENV/ENV, SHELLOPTS, BASHOPTS, CDPATH,
 #   GLOBIGNORE and inherited functions.
 #
+# * Python state-store.py runs with -I -S (no imported user paths/startup).
 # * Where helpers come from. PATH is pinned to /usr/bin (root-owned on
 #   Omarchy), so hyprctl, jq, omarchy-*, stat, mktemp, mv, ... resolve to the
 #   base-OS binaries only.
 #
 # * State on disk (open_state_dir, load_checked_json, atomic_write).
 #   - The state directory path is walked from "/" one component at a time.
-#     Each component is lstat'ed (symlinks are refused, never followed),
-#     opened, and the opened descriptor is fstat'ed and required to be the
-#     same device/inode. Every ancestor must be owned by root or by this user
+#     Each component is opened with O_DIRECTORY | O_NOFOLLOW, then fstat'ed.
+#     Every ancestor must be owned by root or by this user
 #     and not be group/other-writable; the leaf must be owned by this user
 #     with mode 0700. Each step is resolved relative to the previous step's
 #     open descriptor (/proc/self/fd/<fd>/<name>, i.e. openat semantics), so
@@ -52,11 +52,13 @@
 #   - The state file is lstat'ed before it is opened (must be a regular file,
 #     so a symlink/FIFO/device is never opened), then the open descriptor is
 #     fstat'ed and must be the same inode, owned by this user, single link,
-#     no group/other write bit, and at most MAX_STATE_FILE_BYTES. At most that
-#     many bytes are read. A file failing any check is renamed aside and
+#     no group/other write bit, and at most MAX_STATE_FILE_BYTES.
+#     O_NOFOLLOW | O_NONBLOCK prevents symlink following or FIFO blocking
+#     even if the entry is replaced during the open. Oversized reads are
+#     rejected. A file failing any check is renamed aside and
 #     never parsed.
-#   - Writes create a fresh 0600 temp file (O_EXCL) in the directory, verify
-#     it, and rename it over the state file. The state file itself is never
+#   - Writes create a fresh 0600 temp file (O_EXCL | O_NOFOLLOW) in the
+#     directory, flush it, and rename it over the state file. It is never
 #     opened for writing.
 #
 # * What may influence execution. Persisted state is untrusted input. After
@@ -128,96 +130,15 @@ die() {
   exit 1
 }
 
-# Prints "<type>|<uid>|<octal mode>|<nlink>|<size>|<dev>:<inode>".
-# Without -L this is lstat (a final symlink is reported, not followed); with
-# -L on /proc/self/fd/N it is fstat of that open descriptor.
-stat_fields() {
-  stat -c '%F|%u|%a|%h|%s|%d:%i' "$@" 2>/dev/null
-}
-
-# GNU stat reports empty regular files as "regular empty file".
-is_regular() {
-  [[ "$1" == "regular file" || "$1" == "regular empty file" ]]
-}
-
-# True if an octal mode has no group/other write bits.
-mode_is_private_enough() {
-  local mode="$1"
-  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  (( (8#$mode & 8#022) == 0 ))
-}
-
-# Walks $STATE_DIR from "/" descriptor-relatively (see header), creating
-# missing components with mode 0700, and leaves $STATE_FD open on the leaf.
+# Adopts directory descriptors opened by state-store.py with O_NOFOLLOW.
+# Every ancestor is checked before opening its child.
 open_state_dir() {
-  local -a raw_parts=() parts=()
-  local part
-  IFS='/' read -r -a raw_parts <<<"${STATE_DIR#/}"
-  for part in "${raw_parts[@]}"; do
-    [[ -n "$part" ]] || continue
-    if [[ "$part" == "." || "$part" == ".." ]]; then
-      die "Refusing state path containing . or ..: $STATE_DIR"
-    fi
-    parts+=("$part")
-  done
-  (( ${#parts[@]} >= 2 )) || die "Invalid state path: $STATE_DIR"
-
-  local cur_fd next_fd
-  exec {cur_fd}</ || die "Could not open /"
-
-  local i last=$(( ${#parts[@]} - 1 )) shown="" entry
-  local lfields ltype luid lmode lnlink lsize lid
-  local ffields ftype fuid fmode fnlink fsize fid
-  for (( i = 0; i <= last; i++ )); do
-    part="${parts[i]}"
-    shown+="/$part"
-    entry="/proc/self/fd/$cur_fd/$part"
-
-    if [[ ! -e "$entry" && ! -L "$entry" ]]; then
-      # mkdir never follows a symlink in the final component. With umask
-      # 077 new directories are 0700. This only succeeds where this user may
-      # write (i.e. beneath $HOME); anywhere else the lstat below fails.
-      mkdir -- "$entry" 2>/dev/null || true
-    fi
-
-    lfields="$(stat_fields -- "$entry")" || die "State path component missing: $shown"
-    IFS='|' read -r ltype luid lmode lnlink lsize lid <<<"$lfields"
-    [[ "$ltype" == "directory" ]] \
-      || die "Refusing state path component that is not a plain directory (symlinks are not followed): $shown"
-
-    { exec {next_fd}<"$entry"; } 2>/dev/null || die "Could not open state path component: $shown"
-    ffields="$(stat_fields -L -- "/proc/self/fd/$next_fd")" || ffields=""
-    IFS='|' read -r ftype fuid fmode fnlink fsize fid <<<"$ffields"
-    [[ "$ftype" == "directory" && -n "$fid" && "$fid" == "$lid" ]] \
-      || die "State path component changed while opening: $shown"
-
-    if (( i == last )); then
-      [[ "$fuid" == "$EUID" ]] || die "Refusing state directory not owned by you: $shown"
-      if [[ "$fmode" != "700" ]]; then
-        # Our own private directory: re-assert its mode on the open
-        # descriptor (not by pathname), then re-verify.
-        chmod 700 -- "/proc/self/fd/$next_fd" 2>/dev/null || die "Could not secure state directory: $shown"
-        ffields="$(stat_fields -L -- "/proc/self/fd/$next_fd")" || ffields=""
-        IFS='|' read -r ftype fuid fmode fnlink fsize fid <<<"$ffields"
-        [[ "$fmode" == "700" && "$fid" == "$lid" ]] || die "Could not secure state directory: $shown"
-      fi
-    else
-      [[ "$fuid" == "$EUID" || "$fuid" == "0" ]] \
-        || die "Refusing state path component owned by another user: $shown"
-      mode_is_private_enough "$fmode" \
-        || die "Refusing group/other-writable state path component: $shown"
-    fi
-
-    if [[ "$cur_fd" != "$PARENT_FD" ]]; then
-      exec {cur_fd}<&-
-    fi
-    cur_fd=$next_fd
-    if (( i == last - 1 )); then
-      PARENT_FD=$next_fd
-    fi
-  done
-
-  STATE_FD=$cur_fd
+  # Python supplies real openat/O_NOFOLLOW operations, unavailable in Bash.
+  # Its descriptors survive exec and remain open for every state operation.
+  [[ "${1:-}" == "--state-fds" ]] || die "Missing protected state descriptors"
+  STATE_FD="$2"
+  PARENT_FD="$3"
+  [[ "$STATE_FD" =~ ^[0-9]+$ && "$PARENT_FD" =~ ^[0-9]+$ ]] || die "Invalid state descriptors"
   STATE_ROOT="/proc/self/fd/$STATE_FD"
 }
 
@@ -236,7 +157,7 @@ readonly VALIDATE_STATE_JQ='
     and (.cmd | type == "array")
     and ((.cmd | length) > 0)
     and ((.cmd | length) <= $maxArgs)
-    and (.cmd | all(type == "string" and (length <= $maxArgLen)))
+    and (.cmd | all(type == "string" and (length <= $maxArgLen) and (index("\u0000") == null)))
     and ((.cmd[0] | length) > 0);
   def clean_title:
     if type == "string" then clean_chars | .[:$maxStr] else "" end;
@@ -279,53 +200,16 @@ validate_state() {
 # the header. Sets LOADED_JSON to the validated document.
 # Returns 0 = loaded, 1 = present but rejected (REJECT_REASON set), 2 = absent.
 load_checked_json() {
-  local root="$1" name="$2"
-  local entry="$root/$name"
+  local root="$1" name="$2" raw result
   LOADED_JSON=""
   REJECT_REASON=""
-
-  local lfields ltype luid lmode lnlink lsize lid
-  lfields="$(stat_fields -- "$entry")" || return 2
-  IFS='|' read -r ltype luid lmode lnlink lsize lid <<<"$lfields"
-
-  # Checked on the directory entry *before* opening, so a symlink, FIFO,
-  # socket, device or directory is never opened at all.
-  if ! is_regular "$ltype"; then
-    REJECT_REASON="not a plain file"
-    return 1
+  raw="$(/usr/bin/python3 -I -S "$STORE_PATH" read "${root##*/}" "$name")"
+  result=$?
+  if (( result != 0 )); then
+    REJECT_REASON="unsafe file type, ownership, permissions, size or changed file"
+    return "$result"
   fi
-  if ! [[ "$lsize" =~ ^[0-9]+$ ]] || (( lsize > MAX_STATE_FILE_BYTES )); then
-    REJECT_REASON="abnormally large"
-    return 1
-  fi
-
-  local fd
-  { exec {fd}<"$entry"; } 2>/dev/null || return 2
-
-  local ffields ftype fuid fmode fnlink fsize fid
-  ffields="$(stat_fields -L -- "/proc/self/fd/$fd")" || ffields=""
-  IFS='|' read -r ftype fuid fmode fnlink fsize fid <<<"$ffields"
-
-  local why=""
-  if ! is_regular "$ftype" || [[ -z "$fid" || "$fid" != "$lid" ]]; then
-    why="changed while opening"
-  elif [[ "$fuid" != "$EUID" ]]; then
-    why="not owned by you"
-  elif [[ "$fnlink" != "1" ]]; then
-    why="unexpected hard links"
-  elif ! mode_is_private_enough "$fmode"; then
-    why="unsafe permissions"
-  elif ! [[ "$fsize" =~ ^[0-9]+$ ]] || (( fsize > MAX_STATE_FILE_BYTES )); then
-    why="abnormally large"
-  fi
-  if [[ -n "$why" ]]; then
-    exec {fd}<&-
-    REJECT_REASON="$why"
-    return 1
-  fi
-
-  LOADED_JSON="$(head -c "$MAX_STATE_FILE_BYTES" <&"$fd" | validate_state)"
-  exec {fd}<&-
+  LOADED_JSON="$(printf '%s' "$raw" | validate_state)"
   if [[ -z "$LOADED_JSON" ]]; then
     REJECT_REASON="not valid JSON"
     return 1
@@ -343,22 +227,8 @@ quarantine_state_file() {
 
 # Writes stdin to the state file atomically (see header).
 atomic_write() {
-  local tmp
-  tmp="$(mktemp -- "$STATE_ROOT/.layouts.XXXXXX")" || die "Could not create temp state file"
-  if ! cat >"$tmp"; then
-    rm -f -- "$tmp"
-    die "Could not write state"
-  fi
-
-  local fields ftype fuid fmode fnlink _size _id
-  fields="$(stat_fields -- "$tmp")" || fields=""
-  IFS='|' read -r ftype fuid fmode fnlink _size _id <<<"$fields"
-  if ! is_regular "$ftype" || [[ "$fuid" != "$EUID" || "$fnlink" != "1" || "$fmode" != "600" ]]; then
-    rm -f -- "$tmp"
-    die "Temp state file failed verification"
-  fi
-
-  mv -fT -- "$tmp" "$STATE_ROOT/$STATE_FILE_NAME" || { rm -f -- "$tmp"; die "Could not replace state file"; }
+  /usr/bin/python3 -I -S "$STORE_PATH" write "$STATE_FD" "$STATE_FILE_NAME" \
+    || die "Could not atomically write protected state"
 }
 
 # One-time migration of the pre-1.2 state file from the shared parent
@@ -475,8 +345,7 @@ wait_for_new_window_of_class() {
 # character-by-character scanning: the input is only ever treated as data,
 # never handed to a shell/`eval` to interpret, so nothing in it (`;`, `$(...)`,
 # backticks, redirects, etc.) can execute anything, no matter how it got here
-# (a .desktop file's Exec= line, or a flattened /proc/<pid>/cmdline value
-# recovered from persisted state).
+# (a .desktop file's Exec= line). Persisted command strings are never split.
 tokenize_words() {
   local line="$1"
   local -a tokens=()
@@ -523,7 +392,7 @@ tokenize_words() {
     (( ${#token} <= MAX_ARG_LEN )) || return 1
   done
 
-  printf '%s\0' "${tokens[@]}" | jq -R -s -c 'split(" ")[:-1]'
+  printf '%s\0' "${tokens[@]}" | jq -R -s -c 'split("\u0000")[:-1]'
 }
 
 # Writes a one-shot launcher script with $cmd_json's argv baked in via jq's
@@ -531,25 +400,15 @@ tokenize_words() {
 # $cmd_json comes from the validated document.
 build_launcher() {
   local launcher="$1" cmd_json="$2"
-  local count first
-  count="$(jq 'length' <<<"$cmd_json")" || return 1
-  first="$(jq -r '.[0]' <<<"$cmd_json")" || return 1
-
-  if [[ "$count" == "1" && "$first" == *' '* ]]; then
-    # A single argv element containing spaces is a strong signal the real
-    # command line got flattened into one string somewhere upstream (seen
-    # with some Electron apps' /proc/<pid>/cmdline) rather than kept as real
-    # argv -- exec'ing it literally would try to run a file whose name is
-    # that whole string. Recovering the intended words with a plain,
-    # non-executing tokenizer (rather than `sh -c`) means nothing in a
-    # stored value -- however it got there -- is ever interpreted as shell
-    # syntax.
-    local recovered
-    recovered="$(tokenize_words "$first")" || return 1
-    cmd_json="$recovered"
-  fi
-
-  jq -r '"#!/bin/bash -p\nexec -- " + (map(@sh) | join(" "))' <<<"$cmd_json" >"$launcher" || return 1
+  local -a env_allow=(PATH=/usr/bin LC_ALL=C.UTF-8)
+  local v env_json
+  for v in HOME XDG_STATE_HOME XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY; do
+    if [[ -n "${!v:-}" ]]; then env_allow+=("$v=${!v}"); fi
+  done
+  env_json="$(printf '%s\0' "${env_allow[@]}" | jq -R -s -c 'split("\u0000")[:-1]')" || return 1
+  jq -r --argjson env "$env_json" \
+    '"#!/bin/bash -p\nexec /usr/bin/env -i -- " + (($env + .) | map(@sh) | join(" "))' \
+    <<<"$cmd_json" >"$launcher" || return 1
   chmod 700 -- "$launcher"
 }
 
@@ -645,7 +504,7 @@ cmd_save() {
       # Args are piped in as NUL-separated stdin rather than jq CLI args,
       # since an argv entry that looks like a flag (e.g. "--app-id=...")
       # would otherwise be parsed by jq itself instead of treated as a string.
-      cmd_json="$(printf '%s\0' "${argv[@]}" | jq -R -s -c 'split(" ")[:-1]')"
+      cmd_json="$(printf '%s\0' "${argv[@]}" | jq -R -s -c 'split("\u0000")[:-1]')"
     fi
 
     jq -n -c --arg ws "$ws" --arg class "$class" --arg title "$title" --argjson cmd "$cmd_json" \
@@ -861,7 +720,12 @@ cmd_list() {
   jq -c '.layouts |= map_values(map_values(map({class, title})))' <<<"$STATE_JSON"
 }
 
-open_state_dir
+STORE_PATH="${SCRIPT_PATH%/*}/state-store.py"
+if [[ "${1:-}" != "--state-fds" ]]; then
+  exec /usr/bin/python3 -I -S "$STORE_PATH" start "$STATE_DIR" "$SCRIPT_PATH" "$@"
+fi
+open_state_dir "$@"
+shift 3
 migrate_legacy_state
 load_state
 
