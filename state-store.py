@@ -94,7 +94,7 @@ def main():
         os.set_inheritable(fd, True)
         os.set_inheritable(parent, True)
         allow = {key: os.environ[key] for key in (
-            "HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+            "HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
             "HYPRLAND_INSTANCE_SIGNATURE", "DBUS_SESSION_BUS_ADDRESS",
             "WAYLAND_DISPLAY") if key in os.environ}
         allow.update(PATH="/usr/bin", LC_ALL="C.UTF-8")

@@ -402,7 +402,7 @@ build_launcher() {
   local launcher="$1" cmd_json="$2"
   local -a env_allow=(PATH=/usr/bin LC_ALL=C.UTF-8)
   local v env_json
-  for v in HOME XDG_STATE_HOME XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY; do
+  for v in HOME XDG_STATE_HOME XDG_RUNTIME_DIR XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY; do
     if [[ -n "${!v:-}" ]]; then env_allow+=("$v=${!v}"); fi
   done
   env_json="$(printf '%s\0' "${env_allow[@]}" | jq -R -s -c 'split("\u0000")[:-1]')" || return 1
@@ -648,7 +648,7 @@ script=$script_q
 owner="\$(/usr/bin/stat -c %u -- "\$script" 2>/dev/null)" || exit 0
 [[ "\$owner" == "\$EUID" || "\$owner" == "0" ]] || exit 0
 env_allow=(PATH=/usr/bin LC_ALL=C.UTF-8)
-for v in HOME XDG_STATE_HOME XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY; do
+for v in HOME XDG_STATE_HOME XDG_RUNTIME_DIR XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY; do
   if [[ -n "\${!v:-}" ]]; then env_allow+=("\$v=\${!v}"); fi
 done
 exec /usr/bin/env -i "\${env_allow[@]}" /bin/bash --noprofile --norc -p -- "\$script" restore-boot
